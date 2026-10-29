@@ -1,3 +1,4 @@
+
 name: workflow
 
 on:
@@ -21,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Lint code
         run: echo "Linting repository"
@@ -40,12 +41,11 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Wait for apt lock
         run: |
           set -e
-          echo "Waiting for apt/dpkg locks..."
 
           for i in $(seq 1 60); do
             if sudo fuser \
@@ -73,21 +73,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq unzip
 
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to Amazon ECR
-        id: build-image
+      - name: Build, Tag, and Push Image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
-          IMAGE_TAG: latest
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          set -e
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          set -euo pipefail
+
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
   Continuous-Deployment:
     name: Continuous Deployment
@@ -97,40 +111,60 @@ jobs:
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REGISTRY: ${{ secrets.AWS_ECR_LOGIN_URI }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
 
       - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Pull latest image
+      - name: Pull Docker Image
         run: |
-          set -e
-          docker pull "${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest"
+          set -euo pipefail
+          docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
 
-      - name: Stop and remove existing container
+      - name: Stop and Remove Existing Container
         run: |
           if docker ps -q --filter "name=^/cnncls$" | grep -q .; then
             docker stop cnncls
           fi
 
           if docker ps -aq --filter "name=^/cnncls$" | grep -q .; then
-            docker rm -fv cnncls
+            docker rm cnncls
           fi
 
-      - name: Run Docker container
+      - name: Run Docker Container
         run: |
-          set -e
+          set -euo pipefail
+
           docker run -d \
+            --restart unless-stopped \
             -p 8080:8080 \
             --name cnncls \
             -e AWS_REGION="$AWS_REGION" \
             -e AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION" \
-            "${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest"
+            "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
 
-      - name: Clean previous images and containers
+      - name: Verify Container
         run: |
-          docker system prune -f
+          sleep 5
+          docker ps --filter "name=^/cnncls$"
+          docker logs --tail 50 cnncls
+
+      - name: Clean Previous Images
+        if: success()
+        run: docker image prune -f
