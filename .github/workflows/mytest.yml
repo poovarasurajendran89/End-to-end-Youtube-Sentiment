@@ -10,10 +10,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: workflow-main
+  cancel-in-progress: false
+
 jobs:
   integration:
     name: Continuous Integration
     runs-on: self-hosted
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -28,15 +33,43 @@ jobs:
     name: Continuous Delivery
     needs: integration
     runs-on: self-hosted
+
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
+      - name: Wait for apt lock
+        run: |
+          set -e
+          echo "Waiting for apt/dpkg locks..."
+
+          for i in $(seq 1 60); do
+            if sudo fuser \
+              /var/lib/dpkg/lock-frontend \
+              /var/lib/dpkg/lock \
+              /var/lib/apt/lists/lock \
+              /var/cache/apt/archives/lock \
+              >/dev/null 2>&1; then
+              echo "apt is busy. Waiting 5 seconds..."
+              sleep 5
+            else
+              echo "apt locks appear available."
+              break
+            fi
+
+            if [ "$i" -eq 60 ]; then
+              echo "Timed out waiting for apt locks."
+              exit 1
+            fi
+          done
+
       - name: Install Utilities
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y jq unzip
 
@@ -51,40 +84,53 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
           IMAGE_TAG: latest
         run: |
-          # Build a docker container and
-          # push it to ECR so that it can
-          # be deployed to ECS.
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          set -e
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-          
-          
+
   Continuous-Deployment:
+    name: Continuous Deployment
     needs: build-and-push-ecr-image
     runs-on: self-hosted
+
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v3
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-      
-      
-      - name: Pull latest images
+
+      - name: Pull latest image
         run: |
-         docker pull ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
-         
-      - name: Stop and remove container if running
+          set -e
+          docker pull "${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest"
+
+      - name: Stop and remove existing container
         run: |
-         docker ps -q --filter "name=cnncls" | grep -q . && docker stop cnncls && docker rm -fv cnncls
-       
-      - name: Run Docker Image to serve users
+          if docker ps -q --filter "name=^/cnncls$" | grep -q .; then
+            docker stop cnncls
+          fi
+
+          if docker ps -aq --filter "name=^/cnncls$" | grep -q .; then
+            docker rm -fv cnncls
+          fi
+
+      - name: Run Docker container
         run: |
-         docker run -d -p 8080:8080 --name=cnncls -e AWS_REGION=${{ secrets.AWS_REGION }} -e AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}  ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+          set -e
+          docker run -d \
+            -p 8080:8080 \
+            --name cnncls \
+            -e AWS_REGION="$AWS_REGION" \
+            -e AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION" \
+            "${{ secrets.AWS_ECR_LOGIN_URI }}/${{ secrets.ECR_REPOSITORY_NAME }}:latest"
+
       - name: Clean previous images and containers
         run: |
-         docker system prune -f
+          docker system prune -f
